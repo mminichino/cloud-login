@@ -8,9 +8,13 @@ import os
 import webbrowser
 import time
 import configparser
+import shutil
+import json
+import hashlib
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
+from cloudlogin.exceptions import Unauthorized
 
 logger = logging.getLogger("awsssomgr")
 logger.addHandler(logging.NullHandler())
@@ -22,10 +26,6 @@ class AWSLoginError(Exception):
     pass
 
 
-class EmptyResultSet(Exception):
-    pass
-
-
 class AuthMode(Enum):
     default = 0
     sso = 1
@@ -34,8 +34,8 @@ class AuthMode(Enum):
 class AWSLogin(object):
     def __init__(
         self,
-        profile: str = "default",
         mode: AuthMode = AuthMode.sso,
+        profile: Optional[str] = None,
         region: Optional[str] = None,
     ):
         self.config_directory = os.path.join(Path.home(), ".aws")
@@ -43,7 +43,7 @@ class AWSLogin(object):
         self.credential_file = os.path.join(self.config_directory, "credentials")
         self.config_data = configparser.ConfigParser()
         self.credential_data = configparser.ConfigParser()
-        self.profile = profile
+        self.profile = profile if profile else "default"
         self.sso_session = None
         self.sso_account_id = None
         self.sso_role_name = None
@@ -61,11 +61,7 @@ class AWSLogin(object):
         )
 
         self.read_config()
-
-        if mode == AuthMode.default:
-            self.default_auth()
-        else:
-            self.sso_auth()
+        self.sts_client = boto3.client("sts")
 
         if region:
             self.aws_region = region
@@ -75,30 +71,28 @@ class AWSLogin(object):
         else:
             self.aws_region = "us-east-1"
 
-        if self.access_key:
-            os.environ["AWS_ACCESS_KEY_ID"] = self.access_key
-        if self.secret_key:
-            os.environ["AWS_SECRET_ACCESS_KEY"] = self.secret_key
-        if self.token:
-            os.environ["AWS_SESSION_TOKEN"] = self.token
+        if os.environ.get("AWS_PROFILE"):
+            self.profile = os.environ["AWS_PROFILE"]
+
+        self.default_auth()
+
+        if mode == AuthMode.sso:
+            self.sso_auth()
+
+        if not self.is_session_valid():
+            raise Unauthorized("can not login to AWS")
 
         try:
+            logger.debug(f"Initializing AWS environment in region {self.aws_region}")
             self.ec2_client = boto3.client("ec2", region_name=self.aws_region)
-            self.dns_client = boto3.client("route53")
-            self.sts_client = boto3.client("sts")
+            self.s3_client = boto3.client("s3", region_name=self.aws_region)
+            self.dns_client = boto3.client("route53", region_name=self.aws_region)
         except Exception as err:
             raise AWSLoginError(f"can not initialize AWS environment: {err}")
 
     @property
     def account_id(self):
         return self.sts_client.get_caller_identity()["Account"]
-
-    def test_session(self):
-        try:
-            client = boto3.client("s3", region_name=self.aws_region)
-            client.list_buckets()
-        except Exception as err:
-            raise AWSLoginError(f"not authorized: {err}")
 
     def read_config(self):
         if os.path.exists(self.config_file):
@@ -130,7 +124,6 @@ class AWSLogin(object):
                 self.sso_session = contents.get("sso_session")
                 self.sso_account_id = contents.get("sso_account_id")
                 self.sso_role_name = contents.get("sso_role_name")
-                self.aws_region = contents.get("region")
                 if not self.sso_session:
                     self.sso_start_url = contents.get("sso_start_url")
                     self.sso_region = contents.get("sso_region")
@@ -147,23 +140,22 @@ class AWSLogin(object):
                         "sso_registration_scopes"
                     )
 
-    def get_auth_config(self) -> dict:
-        self.test_session()
+    @staticmethod
+    def get_auth_config() -> dict:
         session = botocore.session.get_session()
         return {
-            "AWS_ACCESS_KEY_ID": session.get_credentials().access_key,
-            "AWS_SECRET_ACCESS_KEY": session.get_credentials().secret_key,
-            "AWS_SESSION_TOKEN": session.get_credentials().token,
+            "aws_access_key_id": session.get_credentials().access_key,
+            "aws_secret_access_key": session.get_credentials().secret_key,
+            "aws_session_token": session.get_credentials().token,
         }
 
-    @staticmethod
-    def auth_expired(timestamp):
-        if timestamp:
-            _timestamp = timestamp / 1000
-            expires = datetime.fromtimestamp(_timestamp).astimezone(timezone.utc)
-            if datetime.now(timezone.utc) < expires:
-                return False
-        return True
+    def is_session_valid(self) -> bool:
+        try:
+            self.sts_client.get_caller_identity()
+            return True
+        except Exception as err:
+            logger.debug(f"is_session_valid: {err}")
+            return False
 
     def default_auth(self):
         if "AWS_ACCESS_KEY_ID" in os.environ and "AWS_SECRET_ACCESS_KEY" in os.environ:
@@ -172,45 +164,91 @@ class AWSLogin(object):
             if "AWS_SESSION_TOKEN" in os.environ:
                 self.token = os.environ["AWS_SESSION_TOKEN"]
         else:
-            session = boto3.Session(profile_name=self.profile)
-            credentials = session.get_credentials()
-            self.access_key = credentials.access_key
-            self.secret_key = credentials.secret_key
+            session = botocore.session.Session()
+            profiles_config = session.full_config.get("profiles", {})
+            default_config: dict = profiles_config.get(self.profile, {})
+
+            self.access_key = default_config.get("aws_access_key_id")
+            self.secret_key = default_config.get("aws_secret_access_key")
+            self.token = default_config.get("aws_session_token")
 
     def save_auth(self):
-        dt = datetime.fromtimestamp(self.token_expiration / 1000)
-        token_expiration = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
-        self.credential_data[self.profile] = {
+        profile_config: dict = {
             "aws_access_key_id": self.access_key,
             "aws_secret_access_key": self.secret_key,
             "aws_session_token": self.token,
-            "x_security_token_expires": token_expiration,
         }
+        self.credential_data[self.profile] = profile_config
         with open(self.credential_file, "w") as config_file:
             self.credential_data.write(config_file)
+
+    def clear_cached_credentials(self):
+        cli_cache_dir = os.path.join(self.config_directory, "cli", "cache")
+        sso_cache_dir = os.path.join(self.config_directory, "sso", "cache")
+
+        for cache_dir in [cli_cache_dir, sso_cache_dir]:
+            if os.path.exists(cache_dir):
+                logger.debug(f"Cleaning cache directory: {cache_dir}")
+                try:
+                    shutil.rmtree(cache_dir)
+                    logger.debug("Cleaned cache directory")
+                except Exception as err:
+                    logger.warning(
+                        f"Failed to clean cache directory {cache_dir}: {err}"
+                    )
+
+    def save_sso_token(
+        self, token_data, client_creds, session_name, start_url, sso_region
+    ):
+        try:
+            sso_cache_dir = os.path.join(self.config_directory, "sso", "cache")
+            os.makedirs(sso_cache_dir, exist_ok=True)
+
+            token_cache_key = hashlib.sha1(session_name.encode("utf-8")).hexdigest()
+            token_cache_file = os.path.join(sso_cache_dir, f"{token_cache_key}.json")
+
+            expires_in = token_data.get("expiresIn", 3600)
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+            expires_at = expires_at.replace(microsecond=0)
+
+            registration_expires_at = datetime.now(timezone.utc) + timedelta(days=90)
+            registration_expires_at = registration_expires_at.replace(microsecond=0)
+
+            token_cache_data = {
+                "startUrl": start_url,
+                "region": sso_region,
+                "accessToken": token_data["accessToken"],
+                "expiresAt": expires_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "clientId": client_creds["clientId"],
+                "clientSecret": client_creds["clientSecret"],
+                "registrationExpiresAt": registration_expires_at.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            }
+
+            if "refreshToken" in token_data:
+                token_cache_data["refreshToken"] = token_data["refreshToken"]
+
+            with open(token_cache_file, "w") as f:
+                json.dump(token_cache_data, f)
+
+            logger.debug(f"Saved SSO token to cache: {token_cache_file}")
+        except Exception as err:
+            logger.warning(f"Failed to save SSO token to cache: {err}")
 
     def sso_auth(self):
         token = {}
 
         self.read_sso_config()
 
-        session = botocore.session.Session()
-        profiles_config = session.full_config.get("profiles", {})
-        default_config = profiles_config.get(self.profile, {})
-
-        self.access_key = default_config.get("aws_access_key_id")
-        self.secret_key = default_config.get("aws_secret_access_key")
-        self.token = default_config.get("aws_session_token")
-        token_expiration_str = default_config.get("x_security_token_expires")
-        if token_expiration_str:
-            dt = datetime.strptime(token_expiration_str, "%Y-%m-%dT%H:%M:%S.%f")
-            self.token_expiration = dt.timestamp() * 1000
-
-        if not self.auth_expired(self.token_expiration):
+        if self.is_session_valid():
+            logger.debug("sso_auth: using existing session")
             return
 
         if not self.sso_account_id or not self.sso_start_url or not self.sso_region:
             AWSLoginError('Please run "aws configure sso" to setup SSO')
+
+        self.clear_cached_credentials()
 
         session = boto3.Session()
         account_id = self.sso_account_id
@@ -249,6 +287,11 @@ class AWSLogin(object):
             except sso_oidc.exceptions.AuthorizationPendingException:
                 pass
 
+        if token:
+            self.save_sso_token(
+                token, client_creds, self.sso_session, start_url, region
+            )
+
         access_token = token["accessToken"]
         sso = session.client("sso", region_name=region)
         account_roles = sso.list_account_roles(
@@ -258,7 +301,7 @@ class AWSLogin(object):
         roles = account_roles["roleList"]
         role = next((r for r in roles if r.get("roleName") == self.sso_role_name), None)
         if not role:
-            AWSLoginError(
+            raise AWSLoginError(
                 f"Role {self.sso_role_name} is not available for account {self.sso_account_id}"
             )
         role_creds = sso.get_role_credentials(
@@ -274,6 +317,13 @@ class AWSLogin(object):
         self.token = session_creds["sessionToken"]
         self.token_expiration = session_creds["expiration"]
         self.save_auth()
+
+    @property
+    def expiration(self) -> Optional[datetime]:
+        if not self.token_expiration:
+            return None
+        dt = datetime.fromtimestamp(self.token_expiration / 1000)
+        return dt
 
     @property
     def region(self):
