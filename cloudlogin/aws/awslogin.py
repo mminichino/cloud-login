@@ -15,8 +15,9 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from cloudlogin.exceptions import Unauthorized
+from cloudlogin.common.file_update import update_values_in_file
 
-logger = logging.getLogger("awsssomgr")
+logger = logging.getLogger("cloudlogin")
 logger.addHandler(logging.NullHandler())
 logging.getLogger("botocore").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
@@ -363,3 +364,24 @@ class AWSLogin(object):
             raise AWSLoginError("can not get AWS availability zones")
 
         return self.zone_list
+
+    def update_file(self, file_path: Path):
+        updates: dict = {
+            "aws_access_key": {
+                "value": self.access_key,
+                "aliases": ["access_key", "aws_access_key_id", "access_key_id", "aws_access_key"]
+            },
+            "aws_secret_key": {
+                "value": self.secret_key,
+                "aliases": ["secret_key", "aws_secret_access_key", "secret_access_key", "secret"]
+            },
+            "aws_session_token": {
+                "value": self.token,
+                "aliases": ["session_token", "aws_session_token", "token"]
+            }
+        }
+
+        try:
+            update_values_in_file(file_path.absolute(), updates)
+        except Exception as err:
+            raise AWSLoginError(f"error updating file {file_path}: {err}")
