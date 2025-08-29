@@ -23,7 +23,11 @@ def update_values_in_file(file_path, updates):
                     escaped_alias = re.escape(alias)
                     pattern = re.compile(r'^(%s\s*=\s*").*(")' % escaped_alias, re.MULTILINE)
 
-                    content, num_subs = re.subn(pattern, f'\\1{value_to_set}\\2', content)
+                    content, num_subs = re.subn(
+                        pattern,
+                        lambda m, v=value_to_set: f"{m.group(1)}{v}{m.group(2)}",
+                        content,
+                    )
 
                     if num_subs > 0:
                         logger.info(f"Updated {alias}")
